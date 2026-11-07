@@ -1,8 +1,16 @@
+import { randomBytes } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { ApprovalQueue } from './approvals.ts';
+import { CallLog } from './calls.ts';
+import { ClientRegistry } from './clients.ts';
 import { assertSafeConfig, loadConfig } from './config.ts';
 import { openDb } from './db.ts';
 import { Bus, Poller } from './events.ts';
+import { fileSecret } from './gateway.ts';
+import { Limits } from './limits.ts';
 import { NexusClient } from './nexus/client.ts';
+import { Policy } from './policy.ts';
 import { buildServer } from './server.ts';
 import { TaskStore } from './tasks.ts';
 
@@ -10,11 +18,26 @@ const cfg = loadConfig();
 if (!cfg.nexusToken) throw new Error('NEXUS_SUPERVISOR_TOKEN is required');
 assertSafeConfig(cfg);
 
+// The secret only the gateway presents. Created once, 0600, never logged.
+if (!existsSync(cfg.gatewaySecretPath)) {
+  mkdirSync(dirname(cfg.gatewaySecretPath), { recursive: true });
+  writeFileSync(cfg.gatewaySecretPath, randomBytes(32).toString('base64url') + '\n', { mode: 0o600 });
+  chmodSync(cfg.gatewaySecretPath, 0o600);
+}
+
 const db = openDb(cfg.dbPath);
-const nexus = new NexusClient(cfg.nexusUrl, cfg.nexusToken);
-const bus = new Bus();
-const tasks = new TaskStore(db, nexus);
-const approvals = new ApprovalQueue(db, nexus, cfg.approvalTtlMs);
+const calls = new CallLog(db);
+const policy = new Policy(cfg.policyPath);
+if (!existsSync(cfg.policyPath)) console.warn(`no policy at ${cfg.policyPath}: defaults apply, and with no roots nothing can start`);
+const nexus = new NexusClient(cfg.nexusUrl, cfg.nexusToken, (c) => calls.record(c));
+const bus = new Bus(db);
+const tasks = new TaskStore(db, nexus, policy);
+let limits: Limits;
+const approvals = new ApprovalQueue(db, nexus, () => policy.get().approvalTtlMs, {
+  stopped: (session) => tasks.markStopped(session, 'approval'),
+  resumed: (session) => limits.resumed(session),
+});
+limits = new Limits(db, nexus, tasks, approvals, bus, policy);
 const poller = new Poller(db, nexus, tasks, approvals, bus, cfg.pollWaitSec);
 let tools: string[] = [];
 
@@ -24,6 +47,9 @@ const connect = async (): Promise<void> => {
     tools = await nexus.listTools();
     console.log('nexus tools:', tools.join(', '));
     poller.start();
+    limits.start();
+    const l = limits.status();
+    if (!l.enforced) console.warn(l.reason);
   } catch (e: any) {
     console.warn(`nexus not usable yet (${e.message}); retrying in 15 s`);
     setTimeout(connect, 15_000);
@@ -32,9 +58,11 @@ const connect = async (): Promise<void> => {
 void connect();
 
 const app = buildServer({
-  tasks, approvals, bus, auth: cfg.auth,
+  tasks, approvals, bus, policy, limits, calls, nexus, auth: cfg.auth,
+  clients: new ClientRegistry(cfg.clientsPath),
+  gatewaySecret: fileSecret(cfg.gatewaySecretPath),
   status: () => ({ online: nexus.online, lastError: nexus.lastError, tools }),
 });
-// Loopback by default: publish over the tailnet with `tailscale serve`, not by binding 0.0.0.0.
+// Loopback by default: phones reach it through `tailscale serve`, orchestrators through the gateway.
 await app.listen({ host: cfg.host, port: cfg.port });
 console.log(`control plane on http://${cfg.host}:${cfg.port} (auth: ${cfg.auth.mode}) -> ${cfg.nexusUrl}`);

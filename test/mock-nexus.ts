@@ -45,6 +45,10 @@ export class MockNexus {
   /** Events with seq <= this were dropped from the buffer (a cursor below it gets `missed`). */
   droppedThrough = 0;
   failSend = false;
+  /** resource_usage readings by session id (the #56 shape is not final; modelled on protocol ResourceSession). */
+  usage = new Map<string, { cpu: number; memory: number; processes: number }>();
+  /** What each terminal has printed, for read_session. */
+  screens = new Map<string, string>();
   private seq = 0;
   private waiters: (() => void)[] = [];
   server!: Server;
@@ -92,6 +96,15 @@ export class MockNexus {
       mcp.registerTool(name, { inputSchema }, async (a: any) => { this.calls.push({ tool: name, args: a }); return text(await fn(a)); });
 
     reg('whoami', {}, () => ({ session: null, access: 'supervisor' }));
+    reg('read_session', {
+      session, lines: z.number().int().min(1).max(2000).default(80),
+      since_cursor: z.number().int().min(0).optional().describe('The cursor an earlier read_session returned'),
+    }, (a) => {
+      const s = this.find(a.session);
+      const all = this.screens.get(s.id) ?? '';
+      const text = a.since_cursor !== undefined ? all.slice(a.since_cursor) : all.split('\n').slice(-a.lines).join('\n');
+      return { text, cursor: all.length };
+    });
     reg('list_sessions', {}, () => [...this.sessions.values()].map((s) => this.summary(s)));
     reg('start_agent', {
       agent: z.enum(AGENTS), prompt: z.string().optional(), name: z.string().optional(),
@@ -150,7 +163,11 @@ export class MockNexus {
         this.find(a.session).paused = a.paused;
         return { processes: 1 };
       });
-      reg('resource_usage', { session: session.optional() }, () => ({ sessions: [] }));
+      reg('resource_usage', { session: session.optional() }, (a) => ({
+        sessions: [...this.sessions.values()].filter((x) => !a.session || x.id === a.session).map((x) => ({
+          sessionId: x.id, name: x.name, ...(this.usage.get(x.id) ?? { cpu: 0, memory: 0, processes: 1 }),
+        })),
+      }));
     }
     return mcp;
   }

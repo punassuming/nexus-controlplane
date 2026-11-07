@@ -5,24 +5,51 @@ import { audit } from './db.ts';
 import type { NexusApi, WatchEvent } from './nexus/types.ts';
 import { TaskStore } from './tasks.ts';
 
+export type BusType = 'agent' | 'approval' | 'task' | 'nexus' | 'limit';
+
 export interface BusEvent {
   seq: number;
-  type: 'agent' | 'approval' | 'task' | 'nexus';
+  ts: number;
+  type: BusType;
+  task_id: string | null;
+  client_id: string | null;
   data: any;
 }
 
-/** In-memory fan-out with a replay ring so SSE clients can resume via Last-Event-ID. */
+/**
+ * Event fan-out, persisted so cursors survive restarts: SSE resumes with Last-Event-ID and orchestrators long-poll
+ * from their own cursor. Each event carries the task's owner, so an orchestrator only ever sees its own tasks.
+ */
 export class Bus extends EventEmitter {
-  private seq = 0;
-  private ring: BusEvent[] = [];
-  publish(type: BusEvent['type'], data: any) {
-    const ev = { seq: ++this.seq, type, data };
-    this.ring.push(ev);
-    if (this.ring.length > 500) this.ring.shift();
-    this.emit('event', ev);
+  private inserts = 0;
+
+  constructor(private db: DatabaseSync, private keep = 20_000) {
+    super();
+    this.setMaxListeners(0);
   }
-  since(seq: number): BusEvent[] {
-    return this.ring.filter((e) => e.seq > seq);
+
+  publish(type: BusType, data: any): BusEvent {
+    const task_id: string | null = data?.task_id ?? null;
+    const client_id = task_id ? ((this.db.prepare('SELECT client_id FROM tasks WHERE task_id=?').get(task_id) as any)?.client_id ?? null) : null;
+    const ts = Date.now();
+    const r = this.db.prepare('INSERT INTO events (ts, type, task_id, client_id, data) VALUES (?,?,?,?,?)')
+      .run(ts, type, task_id, client_id, JSON.stringify(data));
+    const ev: BusEvent = { seq: Number(r.lastInsertRowid), ts, type, task_id, client_id, data };
+    if (++this.inserts % 500 === 0) this.db.prepare('DELETE FROM events WHERE seq <= ?').run(ev.seq - this.keep);
+    this.emit('event', ev);
+    return ev;
+  }
+
+  /** Events after `seq`, oldest first; with `client`, only that orchestrator's tasks. */
+  since(seq: number, client?: string, limit = 500): BusEvent[] {
+    const rows = client === undefined
+      ? this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(seq, limit)
+      : this.db.prepare('SELECT * FROM events WHERE seq > ? AND client_id = ? ORDER BY seq LIMIT ?').all(seq, client, limit);
+    return (rows as any[]).map((r) => ({ ...r, data: JSON.parse(r.data) }));
+  }
+
+  head(): number {
+    return Number((this.db.prepare('SELECT MAX(seq) AS s FROM events').get() as any)?.s ?? 0);
   }
 }
 
@@ -55,16 +82,19 @@ export class Poller {
     // Only supervise sessions this harness started; ignore everything else Nexus reports.
     if (!task) return;
     this.tasks.setStatus(task.task_id, ev.state);
-    this.bus.publish('agent', { task_id: task.task_id, ...ev });
     if (ev.state !== 'needs-input') {
-      for (const a of this.approvals.supersede(ev.sessionId)) this.bus.publish('approval', a);
+      this.bus.publish('agent', { task_id: task.task_id, ...ev });
+      // A closed terminal takes every pending request for it along; otherwise only its prompt went away.
+      for (const a of this.approvals.supersede(ev.sessionId, ev.state === 'exited')) this.bus.publish('approval', a);
       return;
     }
     let options = optionsFromChoices(ev.choices ?? []);
     // get_state (#56) has the typed options (key, kind) the watch event leaves out.
     const live = await this.nexus.getState(ev.sessionId).catch(() => undefined);
     if (live?.agent?.state === 'needs-input' && live.agent.options?.length) options = live.agent.options;
+    // The approval exists before anyone hears about the prompt, so a woken orchestrator can answer it at once.
     const a = this.approvals.enqueue({ session_id: ev.sessionId, task_id: task.task_id, detail: ev.detail, tail: ev.tail, options });
+    this.bus.publish('agent', { task_id: task.task_id, ...ev, approval_id: a.id });
     this.bus.publish('approval', a);
   }
 

@@ -6,7 +6,12 @@ export interface Config {
   host: string;
   port: number;
   dbPath: string;
-  approvalTtlMs: number;
+  /** Limits and allowlists (JSON, outside Git; reloaded on change). */
+  policyPath: string;
+  /** Orchestrator keys, shared with the gateway (0600). */
+  clientsPath: string;
+  /** The internal secret only the gateway presents (0600, created on first start). */
+  gatewaySecretPath: string;
   pollWaitSec: number;
   auth: { mode: AuthMode; token: string; allowedUsers: string[] };
 }
@@ -24,7 +29,9 @@ export function loadConfig(env = process.env): Config {
     host: env.CONTROLPLANE_HOST ?? '127.0.0.1',
     port: Number(env.CONTROLPLANE_PORT ?? 8787),
     dbPath: env.CONTROLPLANE_DB ?? 'data/controlplane.db',
-    approvalTtlMs: Number(env.APPROVAL_TTL_MS ?? 15 * 60_000),
+    policyPath: env.CONTROLPLANE_POLICY ?? 'data/policy.json',
+    clientsPath: env.CONTROLPLANE_CLIENTS ?? 'data/clients.json',
+    gatewaySecretPath: env.CONTROLPLANE_GATEWAY_SECRET ?? 'data/gateway.secret',
     // Nexus's watch_agents default; most MCP clients allow a call about a minute.
     pollWaitSec: Math.min(Number(env.POLL_WAIT_SEC ?? 50), 50),
     auth: {
@@ -35,7 +42,11 @@ export function loadConfig(env = process.env): Config {
   };
 }
 
-/** Refuse configurations that would put an unauthenticated (or header-trusting) UI on the network. */
+/**
+ * Refuse configurations that would put an unauthenticated (or header-trusting) UI on the network. The control
+ * plane itself never needs a non-loopback listener: orchestrators come through the gateway, phones through
+ * `tailscale serve`.
+ */
 export function assertSafeConfig(cfg: Config) {
   const { mode, token } = cfg.auth;
   if (!['none', 'tailscale', 'token'].includes(mode)) throw new Error(`CONTROLPLANE_AUTH must be none, tailscale or token, not ${mode}`);

@@ -3,15 +3,26 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { StaleApprovalError, type ApprovalQueue } from './approvals.ts';
 import { COOKIE, identify, secretMatches, type AuthMode } from './auth.ts';
+import type { CallLog } from './calls.ts';
+import type { ClientRegistry } from './clients.ts';
 import { gitDiff } from './diff.ts';
 import type { Bus } from './events.ts';
+import type { Limits } from './limits.ts';
 import { NexusError } from './nexus/client.ts';
-import type { TaskStore } from './tasks.ts';
+import { createOrchestrator, gatewayClient, type OrchestratorDeps } from './orchestrator.ts';
+import type { Policy } from './policy.ts';
+import { PolicyError, type TaskStore } from './tasks.ts';
 
-export interface Deps {
+export interface Deps extends OrchestratorDeps {
   tasks: TaskStore;
   approvals: ApprovalQueue;
   bus: Bus;
+  policy: Policy;
+  limits: Limits;
+  calls: CallLog;
+  clients: ClientRegistry;
+  /** The internal secret the gateway presents on /orchestrator/mcp. */
+  gatewaySecret: () => string;
   status: () => { online: boolean; lastError?: string; tools?: string[] };
   auth: { mode: AuthMode; token: string; allowedUsers: string[] };
 }
@@ -22,17 +33,29 @@ declare module 'fastify' {
 
 const indexHtml = () => readFile(fileURLToPath(new URL('../public/index.html', import.meta.url)), 'utf8');
 
-/** Nexus refusals (permission_denied, agent_blocked, …) are the caller's problem; outages are a 502. */
+/** Nexus refusals (permission_denied, agent_blocked, …) and policy refusals are the caller's problem; outages are a 502. */
 function fail(reply: FastifyReply, e: any) {
   if (e instanceof StaleApprovalError) return reply.code(409).send({ error: e.message, stale: true });
+  if (e instanceof PolicyError) return reply.code(403).send({ error: e.message, code: 'policy_denied' });
   if (e instanceof NexusError) return reply.code(e.code === 'offline' ? 502 : 409).send({ error: e.message, code: e.code });
   if (/^unknown /.test(e?.message)) return reply.code(404).send({ error: e.message });
   return reply.code(409).send({ error: String(e?.message ?? e) });
 }
 
-export function buildServer({ tasks, approvals, bus, status, auth }: Deps) {
-  const app = Fastify();
+export function buildServer(d: Deps) {
+  const { tasks, approvals, bus, status, auth } = d;
+  const app = Fastify({ bodyLimit: 1024 * 1024 });
   app.decorateRequest('user', '');
+  const orchestrator = createOrchestrator(d);
+
+  // Orchestrators, via the gateway only. Authenticated by the gateway's secret, not by the UI's auth.
+  app.post('/orchestrator/mcp', async (req, reply) => {
+    const who = gatewayClient(req.headers, d.gatewaySecret(), d.policy);
+    if ('error' in who) return reply.code(who.status).send({ error: who.error });
+    reply.hijack();
+    await orchestrator(req.raw, reply.raw, req.body, who.client);
+  });
+  app.route({ method: ['GET', 'DELETE'], url: '/orchestrator/mcp', handler: (_req, reply) => reply.code(405).header('allow', 'POST').send() });
 
   // Token mode: trade the token for an HttpOnly, SameSite=Strict cookie so the page and SSE work.
   app.get('/login', async (req, reply) => {
@@ -44,7 +67,7 @@ export function buildServer({ tasks, approvals, bus, status, auth }: Deps) {
   });
 
   app.addHook('onRequest', async (req, reply) => {
-    if (req.url.startsWith('/login')) return;
+    if (req.url.startsWith('/login') || req.url.startsWith('/orchestrator/')) return;
     const id = identify(req.headers, auth);
     if ('error' in id) return reply.code(id.status).send({ error: id.error });
     req.user = id.user;
@@ -59,6 +82,10 @@ export function buildServer({ tasks, approvals, bus, status, auth }: Deps) {
   app.get('/api/status', async (req) => ({ ...status(), user: req.user }));
   app.get('/api/tasks', async () => tasks.list());
   app.get('/api/approvals', async (req) => approvals.list((req.query as any).status));
+  app.get('/api/policy', async () => ({ policy: d.policy.get(), error: d.policy.error ?? null, limits: d.limits.status() }));
+  app.get('/api/clients', async () => d.clients.list());
+  app.get('/api/calls', async (req) => d.calls.recent(Number((req.query as any).limit ?? 100)));
+  app.get('/api/metrics', async (req) => d.calls.metrics(Number((req.query as any).since ?? 0)));
 
   app.post('/api/tasks', async (req, reply) => {
     const b = (req.body ?? {}) as any;
@@ -99,7 +126,7 @@ export function buildServer({ tasks, approvals, bus, status, auth }: Deps) {
     if (decision !== 'allow' && decision !== 'deny') return reply.code(404).send({ error: 'bad decision' });
     const optionKey = (req.body as any)?.optionKey;
     try {
-      const a = await approvals.decide(id, decision, req.user, typeof optionKey === 'string' ? optionKey : undefined);
+      const a = await approvals.decide(id, decision, req.user, { optionKey: typeof optionKey === 'string' ? optionKey : undefined });
       bus.publish('approval', a);
       return a;
     } catch (e) {
@@ -115,8 +142,9 @@ export function buildServer({ tasks, approvals, bus, status, auth }: Deps) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     const send = (e: { seq: number; type: string; data: unknown }) =>
       res.write(`id: ${e.seq}\nevent: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`);
-    const last = Number(req.headers['last-event-id'] ?? 0);
-    for (const e of bus.since(last)) send(e);
+    // A reconnect resumes where it left off; a new page starts from now (it loads current state itself).
+    const last = req.headers['last-event-id'];
+    if (last !== undefined) for (const e of bus.since(Number(last))) send(e);
     res.write(`event: status\ndata: ${JSON.stringify(status())}\n\n`);
     const on = (e: any) => send(e);
     bus.on('event', on);

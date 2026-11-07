@@ -55,6 +55,22 @@ export interface WatchResult {
   missed?: boolean;
 }
 
+export interface ReadResult {
+  text: string;
+  cursor?: number;
+  /** The cursor expired; text is a bounded snapshot. */
+  reset?: boolean;
+}
+
+/** A session's process-tree use, from #56 resource_usage (shape modelled on the protocol's ResourceSession). */
+export interface ResourceReading {
+  /** Percent of the whole machine. */
+  cpu: number;
+  memory: number;
+  processes: number;
+  at: number;
+}
+
 export type WaitFor = AgentState | 'settled' | 'attention' | 'command' | 'exited';
 
 /** The surface of Nexus the control plane depends on. */
@@ -68,4 +84,6 @@ export interface NexusApi {
   pauseSession(session: string, paused: boolean): Promise<void>;
   stopSession(session: string): Promise<void>;
   watchAgents(cursor: number | undefined, waitSec: number): Promise<WatchResult>;
+  readSession(session: string, o?: { lines?: number; since_cursor?: number }): Promise<ReadResult>;
+  resourceUsage(session: string): Promise<ResourceReading | undefined>;
 }

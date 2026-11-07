@@ -1,13 +1,14 @@
 {
   "name": "nexus-controlplane",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Supervisor harness on top of the Nexus MCP server",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "tsx src/main.ts",
-    "bridge": "tsx src/bridge.ts",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "gateway": "tsx src/gateway.ts",
+    "client": "tsx src/clients.ts"
   },
   "repository": {
     "type": "git",

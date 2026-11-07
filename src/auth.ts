@@ -10,6 +10,9 @@ import type { IncomingHttpHeaders } from 'node:http';
 export type AuthMode = 'none' | 'tailscale' | 'token';
 
 export const COOKIE = 'cp_token';
+/** Set only by the gateway: the internal secret, and the orchestrator client it authenticated. */
+export const GATEWAY_SECRET_HEADER = 'x-cp-gateway';
+export const CLIENT_HEADER = 'x-cp-client';
 
 export function isLoopback(host: string): boolean {
   return host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host);

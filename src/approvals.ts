@@ -1,31 +1,49 @@
-import { randomUUID } from 'node:crypto';
+/**
+ * Approvals: typed, single-use decisions on one exact request, minted and consumed here. An approval is never a
+ * pattern ("allow all bash"), and deciding one never types prose into a terminal: each kind has a fixed executor.
+ *
+ *   agent_prompt  an agent's own approval menu (raised by the watch loop); executes the chosen option key
+ *   send_keys     an orchestrator wants to type into its task's terminal; executes send_keys {text, enter}
+ *   stop          an orchestrator wants to close its task; executes stop_session
+ *   resume        a resource limit paused a task; executes pause_session {paused: false}
+ */
+import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { audit } from './db.ts';
 import { NexusError } from './nexus/client.ts';
 import type { NexusApi, PromptOption } from './nexus/types.ts';
+import { PERSISTENT } from './policy.ts';
 
-export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired';
+export type ApprovalKind = 'agent_prompt' | 'send_keys' | 'stop' | 'resume';
+export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'stale';
 
 export interface Approval {
   id: string;
+  kind: ApprovalKind;
   task_id: string | null;
   session_id: string;
+  requested_by: string;
+  request: Record<string, any>;
+  request_hash: string;
+  reason: string | null;
   detail: string | null;
   tail: string | null;
   options: PromptOption[];
+  proposed_key: string | null;
+  proposed_by: string | null;
   status: ApprovalStatus;
   created_at: number;
   expires_at: number;
   decided_at: number | null;
   decision: string | null;
   decided_by: string | null;
+  policy_rule: string | null;
+  consumed_at: number | null;
 }
 
-/** The prompt on screen is not the one the human decided on. Nothing was sent. */
+/** The action on screen (or the terminal) is not the one decided on. Nothing was sent. */
 export class StaleApprovalError extends Error {}
 
-/** Choices that grant more than this one action. "Allow once" never presses them. */
-const PERSISTENT = /\balways\b|don'?t ask|\bsession\b|\ball\b|\bevery|\bremember/i;
 const APPROVE = /^(yes|y|allow|approve|accept|proceed|run|continue)\b/i;
 const DENY = /^(no|n|deny|reject|cancel|decline|abort|skip)\b/i;
 /** Escape dismisses Claude Code's and Codex's approval menus (a refusal). */
@@ -51,11 +69,27 @@ export function pickOption(options: PromptOption[], kind: 'allow' | 'deny'): Pro
     : options.find((o) => o.kind === 'deny');
 }
 
+function hash(kind: string, session: string, request: unknown): string {
+  return createHash('sha256').update(JSON.stringify([kind, session, request])).digest('hex');
+}
+
+export interface ApprovalHooks {
+  /** A stop approval was executed. */
+  stopped?: (session: string) => void;
+  /** A resume approval was executed. */
+  resumed?: (session: string) => void;
+}
+
 export class ApprovalQueue {
-  constructor(private db: DatabaseSync, private nexus: NexusApi, private ttlMs: number) {}
+  constructor(
+    private db: DatabaseSync,
+    private nexus: NexusApi,
+    private ttlMs: () => number,
+    private hooks: ApprovalHooks = {},
+  ) {}
 
   private row(r: any): Approval {
-    return { ...r, options: JSON.parse(r.options) };
+    return { ...r, options: JSON.parse(r.options), request: JSON.parse(r.request) };
   }
 
   get(id: string): Approval | undefined {
@@ -70,27 +104,59 @@ export class ApprovalQueue {
     return rows.map((r) => this.row(r));
   }
 
+  pendingPrompt(session_id: string): Approval | undefined {
+    const r = this.db.prepare("SELECT * FROM approvals WHERE session_id=? AND kind='agent_prompt' AND status='pending'").get(session_id);
+    return r ? this.row(r) : undefined;
+  }
+
+  private insert(a: {
+    kind: ApprovalKind; session_id: string; task_id?: string | null; requested_by: string; request: Record<string, any>;
+    reason?: string; detail?: string; tail?: string; options?: PromptOption[];
+  }): Approval {
+    const request_hash = hash(a.kind, a.session_id, a.request);
+    // The same request already waiting: hand back that one rather than minting a second.
+    const same = this.db.prepare("SELECT id FROM approvals WHERE request_hash=? AND status='pending'").get(request_hash) as any;
+    if (same) return this.get(same.id)!;
+    const id = randomUUID();
+    const now = Date.now();
+    this.db.prepare(`INSERT INTO approvals (id, kind, task_id, session_id, requested_by, request, request_hash, reason, detail, tail,
+        options, status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, a.kind, a.task_id ?? null, a.session_id, a.requested_by, JSON.stringify(a.request), request_hash, a.reason ?? null,
+        a.detail ?? null, a.tail ?? null, JSON.stringify(a.options ?? []), 'pending', now, now + this.ttlMs());
+    audit(this.db, 'approval.created', id, { kind: a.kind, session: a.session_id, requested_by: a.requested_by, detail: a.detail });
+    return this.get(id)!;
+  }
+
+  /** An approval for an orchestrator's (or the resource limiter's) request. Always decided by a human. */
+  request(kind: 'send_keys' | 'stop' | 'resume', a: { session_id: string; task_id?: string | null; requested_by: string; request?: Record<string, any>; reason?: string }): Approval {
+    return this.insert({ kind, ...a, request: a.request ?? {} });
+  }
+
   /**
-   * One pending approval per session. A repeat of the same prompt is deduped (typed options from
-   * get_state replace guessed ones); a different prompt supersedes the old approval.
+   * An agent's approval menu, from the watch loop. One pending per session: the same question again is deduped
+   * (typed options from get_state replace guessed ones); a different question supersedes the old one.
    */
   enqueue(i: { session_id: string; task_id?: string | null; detail?: string; tail?: string; options: PromptOption[] }): Approval {
-    const existing = this.db.prepare("SELECT * FROM approvals WHERE session_id=? AND status='pending'").get(i.session_id) as any;
+    const existing = this.pendingPrompt(i.session_id);
     if (existing && (existing.detail ?? '') === (i.detail ?? '')) {
       if (i.options.length) this.db.prepare('UPDATE approvals SET options=? WHERE id=?').run(JSON.stringify(i.options), existing.id);
       return this.get(existing.id)!;
     }
     if (existing) this.supersede(i.session_id);
-    const id = randomUUID();
-    const now = Date.now();
-    this.db.prepare(
-      'INSERT INTO approvals (id, task_id, session_id, detail, tail, options, status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?)',
-    ).run(id, i.task_id ?? null, i.session_id, i.detail ?? null, i.tail ?? null, JSON.stringify(i.options), 'pending', now, now + this.ttlMs);
-    audit(this.db, 'approval.created', id, { session: i.session_id, detail: i.detail });
+    return this.insert({
+      kind: 'agent_prompt', session_id: i.session_id, task_id: i.task_id, requested_by: 'agent',
+      request: { detail: i.detail ?? null }, detail: i.detail, tail: i.tail, options: i.options,
+    });
+  }
+
+  /** An orchestrator's suggested answer to a pending agent prompt, shown to the human who decides. */
+  propose(id: string, client: string, key: string, reason?: string): Approval {
+    this.db.prepare("UPDATE approvals SET proposed_key=?, proposed_by=?, reason=? WHERE id=? AND status='pending'").run(key, client, reason ?? null, id);
+    audit(this.db, 'approval.proposed', id, { by: client, key });
     return this.get(id)!;
   }
 
-  /** Mark pending approvals past their deadline. Nothing is sent: the agent stays blocked on its prompt. */
+  /** Mark pending approvals past their deadline. Nothing is sent. */
   expireDue(now = Date.now()): Approval[] {
     const due = this.db.prepare("SELECT id, session_id FROM approvals WHERE status='pending' AND expires_at<=?").all(now) as any[];
     for (const r of due) {
@@ -100,22 +166,29 @@ export class ApprovalQueue {
     return due.map((r) => this.get(r.id)!);
   }
 
-  /** The prompt went away without a decision here (answered in the app, agent moved on, terminal closed). */
-  supersede(session_id: string, reason = 'superseded'): Approval[] {
-    const rows = this.db.prepare("SELECT id FROM approvals WHERE session_id=? AND status='pending'").all(session_id) as any[];
+  /**
+   * The agent's prompt went away without a decision here (answered in the app, agent moved on). With `all`, every
+   * pending approval for the session closes (its terminal is gone).
+   */
+  supersede(session_id: string, all = false): Approval[] {
+    const rows = this.db.prepare(
+      `SELECT id FROM approvals WHERE session_id=? AND status='pending' ${all ? '' : "AND kind='agent_prompt'"}`,
+    ).all(session_id) as any[];
     for (const r of rows) {
-      this.db.prepare("UPDATE approvals SET status='expired', decided_at=?, decision=? WHERE id=?").run(Date.now(), reason, r.id);
-      audit(this.db, `approval.${reason}`, r.id, { session: session_id });
+      this.db.prepare("UPDATE approvals SET status='stale', decided_at=?, decision='superseded' WHERE id=?").run(Date.now(), r.id);
+      audit(this.db, 'approval.superseded', r.id, { session: session_id });
     }
     return rows.map((r) => this.get(r.id)!);
   }
 
   /**
-   * Answer the prompt. The row is claimed first (no double send), then the agent's live state is checked:
-   * if it is no longer showing this prompt, nothing is typed. Allow once never picks a persistent choice;
-   * deny without a deny choice sends Escape.
+   * Decide and, for an approval, execute it once. The row is claimed first (no double execution). Before anything
+   * is sent, the live state is checked: the agent must still show the same prompt (agent_prompt), or the terminal
+   * must still be open (the other kinds); otherwise nothing is sent and the approval goes stale.
+   *
+   * `by` is a person (UI login), `client:<id>` (an orchestrator refusing a prompt) or `policy:<rule>` (a low-risk rule).
    */
-  async decide(id: string, kind: 'allow' | 'deny', by: string, optionKey?: string): Promise<Approval> {
+  async decide(id: string, verdict: 'allow' | 'deny', by: string, o: { optionKey?: string; rule?: string } = {}): Promise<Approval> {
     const a = this.get(id);
     if (!a) throw new Error('unknown approval');
     if (a.status !== 'pending') throw new Error(`approval already ${a.status}`);
@@ -124,29 +197,57 @@ export class ApprovalQueue {
       throw new Error('approval expired');
     }
     const claimed = this.db.prepare(
-      "UPDATE approvals SET status=?, decided_at=?, decided_by=? WHERE id=? AND status='pending'",
-    ).run(kind === 'allow' ? 'approved' : 'denied', Date.now(), by, id);
+      "UPDATE approvals SET status=?, decided_at=?, decided_by=?, policy_rule=? WHERE id=? AND status='pending'",
+    ).run(verdict === 'allow' ? 'approved' : 'denied', Date.now(), by, o.rule ?? null, id);
     if (claimed.changes !== 1) throw new Error('approval already decided');
-    const reopen = () =>
-      this.db.prepare("UPDATE approvals SET status='pending', decided_at=NULL, decision=NULL, decided_by=NULL WHERE id=?").run(id);
+    const reopen = () => this.db.prepare(
+      "UPDATE approvals SET status='pending', decided_at=NULL, decision=NULL, decided_by=NULL, policy_rule=NULL WHERE id=?",
+    ).run(id);
 
-    let keys: string;
-    let label: string;
+    // Refusing an orchestrator's or the limiter's request executes nothing.
+    if (a.kind !== 'agent_prompt' && verdict === 'deny') {
+      this.db.prepare("UPDATE approvals SET decision='denied' WHERE id=?").run(id);
+      audit(this.db, 'approval.deny', id, { kind: a.kind, session: a.session_id, by });
+      return this.get(id)!;
+    }
+
+    let decision: string;
     try {
       const live = await this.nexus.getState(a.session_id);
-      const agent = live?.running ? live.agent : null;
-      if (agent?.state !== 'needs-input' || (a.detail && agent.detail && agent.detail !== a.detail)) {
-        this.db.prepare("UPDATE approvals SET status='expired', decision='stale' WHERE id=?").run(id);
-        audit(this.db, 'approval.stale', id, { session: a.session_id, by, live: agent ? { state: agent.state, detail: agent.detail } : null });
-        throw new StaleApprovalError('the prompt changed or was answered elsewhere; nothing was sent');
+      const stale = (why: string, data: unknown) => {
+        this.db.prepare("UPDATE approvals SET status='stale', decision='stale' WHERE id=?").run(id);
+        audit(this.db, 'approval.stale', id, { kind: a.kind, session: a.session_id, by, live: data });
+        return new StaleApprovalError(why);
+      };
+      if (!live?.running) throw stale('the terminal is gone; nothing was sent', null);
+
+      if (a.kind === 'agent_prompt') {
+        const agent = live.agent;
+        if (agent?.state !== 'needs-input' || (a.detail && agent.detail && agent.detail !== a.detail)) {
+          throw stale('the prompt changed or was answered elsewhere; nothing was sent', agent && { state: agent.state, detail: agent.detail });
+        }
+        const options = agent.options?.length ? agent.options : a.options;
+        const opt = o.optionKey !== undefined ? options.find((x) => x.key === o.optionKey) : pickOption(options, verdict);
+        if (o.optionKey !== undefined && !opt) throw new Error(`no option ${o.optionKey} on this prompt`);
+        if (!opt && verdict === 'allow') throw new Error('no one-shot allow option on this prompt; choose an option explicitly');
+        // Only a person may pick a persistent grant, and only by naming it.
+        if (opt && PERSISTENT.test(opt.label) && (o.optionKey === undefined || by.includes(':'))) {
+          throw new Error('persistent grants are only chosen explicitly by a person');
+        }
+        await this.nexus.sendKeys(a.session_id, opt?.key ?? ESCAPE);
+        decision = opt?.label ?? 'Escape';
+      } else if (a.kind === 'send_keys') {
+        await this.nexus.sendKeys(a.session_id, String(a.request.text ?? ''), a.request.enter === true);
+        decision = 'keys sent';
+      } else if (a.kind === 'stop') {
+        await this.nexus.stopSession(a.session_id);
+        this.hooks.stopped?.(a.session_id);
+        decision = 'stopped';
+      } else {
+        await this.nexus.pauseSession(a.session_id, false);
+        this.hooks.resumed?.(a.session_id);
+        decision = 'resumed';
       }
-      const options = agent.options?.length ? agent.options : a.options;
-      const opt = optionKey !== undefined ? options.find((o) => o.key === optionKey) : pickOption(options, kind);
-      if (optionKey !== undefined && !opt) throw new Error(`no option ${optionKey} on this prompt`);
-      if (!opt && kind === 'allow') throw new Error('no one-shot allow option on this prompt; choose an option explicitly');
-      keys = opt?.key ?? ESCAPE;
-      label = opt?.label ?? 'Escape';
-      await this.nexus.sendKeys(a.session_id, keys);
     } catch (e: any) {
       if (!(e instanceof StaleApprovalError)) {
         reopen();
@@ -154,8 +255,8 @@ export class ApprovalQueue {
       }
       throw e;
     }
-    this.db.prepare('UPDATE approvals SET decision=? WHERE id=?').run(label, id);
-    audit(this.db, `approval.${kind}`, id, { session: a.session_id, option: label, key: keys === ESCAPE ? 'Escape' : keys, by });
+    this.db.prepare('UPDATE approvals SET decision=?, consumed_at=? WHERE id=? AND consumed_at IS NULL').run(decision, Date.now(), id);
+    audit(this.db, `approval.${verdict}`, id, { kind: a.kind, session: a.session_id, decision, by, ...(o.rule ? { rule: o.rule } : {}) });
     return this.get(id)!;
   }
 }

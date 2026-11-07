@@ -5,47 +5,63 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nexus Control Plane</title>
 <style>
-  :root { --bg:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#d8dee4; --card:#f6f8fa; --warn:#9a6700; --bad:#cf222e; --ok:#1a7f37; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --card:#161b22; --warn:#d29922; --bad:#f85149; --ok:#3fb950; } }
+  :root { --bg:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#d8dee4; --card:#f6f8fa; --warn:#9a6700; --bad:#cf222e; --ok:#1a7f37; --accent:#0969da; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --card:#161b22; --warn:#d29922; --bad:#f85149; --ok:#3fb950; --accent:#4493f8; } }
   * { box-sizing:border-box }
   body { margin:0 auto; padding:16px; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; max-width:980px }
   header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap }
   h1 { font-size:18px; margin:0 } h2 { font-size:12px; margin:22px 0 8px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
-  .card { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:8px; background:var(--card) }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:8px; background:var(--card); overflow-wrap:anywhere }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap }
   .muted { color:var(--muted) } .grow { flex:1; min-width:0 } .small { font-size:12px }
+  .tag { display:inline-block; font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--muted) }
+  .tag.warn { border-color:var(--warn); color:var(--warn) } .tag.ok { border-color:var(--ok); color:var(--ok) }
   input, select, textarea { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; min-width:0 }
-  button { font:inherit; padding:5px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:inherit; cursor:pointer }
+  button { font:inherit; padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:inherit; cursor:pointer; min-height:36px }
   button:disabled { opacity:.5; cursor:default }
   button.allow { border-color:var(--ok); color:var(--ok) } button.deny { border-color:var(--bad); color:var(--bad) }
+  button.primary { border-color:var(--accent); color:var(--accent); font-weight:600 }
   pre { overflow:auto; max-height:360px; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; font:12px/1.4 ui-monospace, monospace; margin:8px 0 0; white-space:pre }
-  #banner { display:none; padding:8px 12px; border:1px solid var(--warn); color:var(--warn); border-radius:6px; margin:10px 0 }
+  pre.wrap { white-space:pre-wrap }
+  .warnbox { padding:8px 12px; border:1px solid var(--warn); color:var(--warn); border-radius:6px; margin:10px 0 }
+  #banner { display:none }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none }
   .needs-input { background:var(--warn) } .working { background:var(--ok) } .error { background:var(--bad) }
   #log { max-height:220px; overflow:auto; font:12px/1.5 ui-monospace, monospace }
   form.start { display:grid; grid-template-columns: 110px 1fr 160px; gap:8px }
   form.start textarea { grid-column: 1 / -1; min-height:56px }
-  @media (max-width:640px) { form.start { grid-template-columns:1fr } }
+  table { border-collapse:collapse; width:100%; font-size:12px } td, th { text-align:left; padding:3px 6px; border-bottom:1px solid var(--line); vertical-align:top }
+  details > summary { cursor:pointer; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; margin:22px 0 8px }
+  .scroll { overflow-x:auto }
+  @media (max-width:640px) { form.start { grid-template-columns:1fr } body { padding:12px } }
 </style>
 </head>
 <body>
 <header><h1>Nexus Control Plane</h1><span class="muted small" id="who"></span></header>
-<div class="muted small">Terminals stay in Nexus. This page starts, guides, approves and stops the agents it supervises.</div>
-<div id="banner"></div>
+<div class="muted small">Terminals stay in Nexus. Orchestrators work through the gateway; anything that types into or closes a terminal waits here for you.</div>
+<div id="banner" class="warnbox"></div>
+<div id="warnings"></div>
 
 <h2>Approvals</h2><div id="approvals"></div>
 
+<h2>Tasks</h2><div id="tasks"></div>
+
 <h2>Start a task</h2>
 <form class="start card" id="start">
-  <select name="agent" aria-label="Agent"><option>claude</option><option>codex</option><option>copilot</option><option>gemini</option><option>aider</option></select>
-  <input name="cwd" placeholder="Working directory on the Nexus host" required aria-label="Working directory">
+  <select name="agent" aria-label="Agent" id="agents"><option>claude</option></select>
+  <input name="cwd" placeholder="Working directory on the Nexus host" required aria-label="Working directory" id="cwd">
   <input name="name" placeholder="Label" aria-label="Label">
   <textarea name="prompt" placeholder="First prompt (optional)" aria-label="First prompt"></textarea>
   <div class="row" style="grid-column:1/-1"><button type="submit">Start</button><span class="muted small" id="start-msg"></span></div>
 </form>
 
-<h2>Tasks</h2><div id="tasks"></div>
 <h2>Events</h2><div id="log" class="card"></div>
+
+<details id="oversight"><summary>Policy, orchestrators and calls</summary>
+  <div class="card" id="policy"></div>
+  <div class="card scroll" id="metrics"></div>
+  <div class="card scroll" id="calls"></div>
+</details>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -54,31 +70,57 @@ const api = (path, method = 'GET', body) =>
   fetch(path, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body && JSON.stringify(body) })
     .then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
 const ago = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`; };
+const mb = (b) => `${Math.round((b ?? 0) / 1048576)} MB`;
 const open = new Set();   // task ids with their diff expanded
 const drafts = {};        // unsent guide text, kept across re-renders
+let taskNames = {};
 
-function approvalCard(a) {
+const who = (a) => a.requested_by === 'agent' ? 'the agent' : a.requested_by === 'limits' ? 'the resource limiter' : a.requested_by;
+
+function approvalBody(a) {
+  const task = esc(taskNames[a.task_id] || a.task_id || a.session_id);
+  if (a.kind === 'send_keys') {
+    return `<b>${esc(who(a))} wants to type into ${task}</b>
+      <pre class="wrap">${esc(a.request.text)}</pre>
+      <div class="muted small">${a.request.enter ? 'then press Enter' : 'without pressing Enter'}</div>`;
+  }
+  if (a.kind === 'stop') return `<b>${esc(who(a))} wants to stop ${task}</b><div class="muted small">closes the terminal and everything running in it</div>`;
+  if (a.kind === 'resume') return `<b>${task} was paused by the resource limiter</b><div class="muted small">resume its processes?</div>`;
+  return `<b>${esc(a.detail || 'Input needed')}</b><div class="muted small">${task} is asking</div>${a.tail ? `<pre>${esc(a.tail)}</pre>` : ''}`;
+}
+
+function approvalButtons(a) {
+  if (a.kind !== 'agent_prompt') {
+    const yes = { send_keys: 'Type it', stop: 'Stop task', resume: 'Resume' }[a.kind];
+    return `<button class="allow" data-approval="${a.id}" data-kind="allow"><b>${yes}</b></button>
+      <button class="deny" data-approval="${a.id}" data-kind="deny"><b>Deny</b></button>`;
+  }
+  const proposal = a.proposed_key && a.options.find((o) => o.key === a.proposed_key);
   const opts = a.options.map((o) => `<button class="${o.kind === 'approve' ? 'allow' : o.kind === 'deny' ? 'deny' : ''}" data-approval="${a.id}" data-key="${esc(o.key)}"
       data-kind="${o.kind === 'deny' ? 'deny' : 'allow'}" title="Type ${esc(o.key)}">${esc(o.key)}. ${esc(o.label)}</button>`).join('');
+  return `${proposal ? `<button class="primary" data-approval="${a.id}" data-key="${esc(proposal.key)}" data-kind="${proposal.kind === 'deny' ? 'deny' : 'allow'}">Approve proposal: ${esc(proposal.label)}</button>` : ''}
+    <button class="allow" data-approval="${a.id}" data-kind="allow"><b>Allow once</b></button>
+    <button class="deny" data-approval="${a.id}" data-kind="deny"><b>Deny</b></button>
+    <span class="muted small">or pick:</span> ${opts}`;
+}
+
+function approvalCard(a) {
   return `<div class="card">
-    <div class="row"><span class="dot needs-input"></span><b class="grow">${esc(a.detail || 'Input needed')}</b>
-      <span class="muted small">waiting ${ago(a.created_at)} · expires ${new Date(a.expires_at).toLocaleTimeString()}</span></div>
-    <div class="muted small">session ${esc(a.session_id)}</div>
-    ${a.tail ? `<pre>${esc(a.tail)}</pre>` : ''}
-    <div class="row" style="margin-top:8px">
-      <button class="allow" data-approval="${a.id}" data-kind="allow"><b>Allow once</b></button>
-      <button class="deny" data-approval="${a.id}" data-kind="deny"><b>Deny</b></button>
-      <span class="muted small">or pick:</span> ${opts}
-    </div></div>`;
+    <div class="row"><span class="dot needs-input"></span><span class="tag">${esc(a.kind.replace('_', ' '))}</span>
+      <span class="grow"></span><span class="muted small">waiting ${ago(a.created_at)} · expires ${new Date(a.expires_at).toLocaleTimeString()}</span></div>
+    <div style="margin-top:6px">${approvalBody(a)}</div>
+    ${a.reason ? `<div class="small" style="margin-top:6px"><span class="muted">${esc(a.proposed_by || who(a))} says:</span> ${esc(a.reason)}</div>` : ''}
+    <div class="row" style="margin-top:8px">${approvalButtons(a)}</div></div>`;
 }
 
 function taskCard(t) {
   const live = t.session_id && !['stopped', 'exited'].includes(t.status);
   return `<div class="card">
-    <div class="row"><span class="dot ${esc(t.status)}"></span><b>${esc(t.name)}</b>
-      <span class="muted grow small">${esc(t.status)} · ${esc(t.cwd)} · ${ago(t.updated_at)} ago</span>
+    <div class="row"><span class="dot ${esc(t.status)}"></span><b class="grow">${esc(t.name)}</b>
+      <span class="tag">${esc(t.client_id || 'you')}</span>
       <button data-diff="${t.task_id}">${open.has(t.task_id) ? 'Hide diff' : 'Diff'}</button>
       <button data-stop="${t.task_id}" ${live ? '' : 'disabled'}>Stop</button></div>
+    <div class="muted small">${esc(t.agent)} · ${esc(t.status)} · ${esc(t.cwd)} · ${ago(t.updated_at)} ago</div>
     ${live ? `<form class="row" data-guide="${t.task_id}" style="margin-top:8px">
       <input class="grow" name="text" placeholder="Guide the agent…" value="${esc(drafts[t.task_id] || '')}" data-draft="${t.task_id}">
       <button type="submit">Send</button></form>` : ''}
@@ -90,18 +132,64 @@ function renderDiff(id, d) {
   $('diff-' + id).innerHTML = `<pre>${esc(d.status)}\n${esc(d.diff) || '(no changes to tracked files)'}${esc(files)}${d.truncated ? '\n… truncated' : ''}</pre>`;
 }
 
+function renderPolicy({ policy: p, error, limits }) {
+  const warnings = [];
+  if (error) warnings.push(error);
+  if (!limits.enforced) warnings.push(limits.reason);
+  if (!p.roots.length) warnings.push('No allowed roots in the policy: nothing can start.');
+  $('warnings').innerHTML = warnings.map((w) => `<div class="warnbox small">${esc(w)}</div>`).join('');
+  $('agents').innerHTML = p.agents.map((a) => `<option>${esc(a)}</option>`).join('');
+  if (!$('cwd').value && p.roots.length === 1) $('cwd').placeholder = p.roots[0];
+  const r = p.resources;
+  $('policy').innerHTML = `<b>Policy</b>
+    <div class="small">Agents: ${p.agents.map(esc).join(', ') || 'none'} · Max active tasks: ${p.maxActiveTasks} · Approvals expire after ${Math.round(p.approvalTtlMs / 60000)} min</div>
+    <div class="small">Roots: ${p.roots.map((x) => `<code>${esc(x)}</code>`).join(', ') || 'none'}</div>
+    <div class="small">Resources: ${r.cpuPercent ? `CPU > ${r.cpuPercent}%` : ''}${r.cpuPercent && r.memoryBytes ? ' or ' : ''}${r.memoryBytes ? `memory > ${mb(r.memoryBytes)}` : ''}${r.cpuPercent || r.memoryBytes ? ` for ${r.sustainSeconds}s → ${r.action}` : 'no thresholds'}
+      <span class="tag ${limits.enforced ? 'ok' : 'warn'}">${limits.enforced ? 'enforced' : 'not enforced'}</span></div>
+    <div class="small">Low-risk rules: ${p.lowRisk.map((x) => `<code title="${esc(x.detail)}">${esc(x.id)}</code>`).join(', ') || 'none (every approve goes to the phone)'}</div>`;
+}
+
+function renderMetrics(m, clients) {
+  const byId = Object.fromEntries(m.clients.map((c) => [c.client, c]));
+  const ids = [...new Set([...clients.map((c) => c.id), ...m.clients.map((c) => c.client)])];
+  $('metrics').innerHTML = `<b>Orchestrators</b><table><tr><th>client</th><th>key</th><th>calls</th><th>wakes</th><th>≈tokens read</th><th>errors</th></tr>
+    ${ids.map((id) => { const c = byId[id] || {}; const k = clients.find((x) => x.id === id);
+      return `<tr><td>${esc(id)}</td><td>${k ? (k.enabled ? 'active' : 'disabled') : 'revoked'}</td><td>${c.calls ?? 0}</td><td>${c.wakes ?? 0}</td><td>${c.approxTokens ?? 0}</td><td>${c.errors ?? 0}</td></tr>`; }).join('')
+      || '<tr><td colspan="6" class="muted">No orchestrator keys yet (npm run client -- add &lt;id&gt;).</td></tr>'}
+    </table><div class="small muted">Nexus calls: ${m.nexus.calls} (${m.nexus.errors} failed)</div>`;
+}
+
+function renderCalls(rows) {
+  $('calls').innerHTML = `<b>Recent MCP calls</b><table><tr><th>time</th><th>dir</th><th>client</th><th>tool</th><th>task / session</th><th>ok</th><th>ms</th></tr>
+    ${rows.slice(0, 60).map((c) => `<tr><td>${new Date(c.ts).toLocaleTimeString()}</td><td>${c.direction === 'in' ? '→ cp' : 'cp → nexus'}</td><td>${esc(c.client || '')}</td>
+      <td>${esc(c.tool)}${c.wake ? ' <span class="tag">wake</span>' : ''}</td><td>${esc(taskNames[c.task_id] || c.task_id || c.session_id || '')}</td>
+      <td>${c.ok ? '✓' : `<span title="${esc(c.error)}">✗</span>`}</td><td>${c.duration_ms}</td></tr>`).join('')}</table>`;
+}
+
+async function refreshOversight() {
+  if (!$('oversight').open) return;
+  const [m, clients, calls] = await Promise.all([api('/api/metrics'), api('/api/clients'), api('/api/calls?limit=60')]);
+  renderMetrics(m, clients);
+  renderCalls(calls);
+}
+
 async function refresh() {
-  const [tasks, approvals] = await Promise.all([api('/api/tasks'), api('/api/approvals?status=pending')]);
+  const [tasks, approvals, policy] = await Promise.all([api('/api/tasks'), api('/api/approvals?status=pending'), api('/api/policy')]);
+  taskNames = Object.fromEntries(tasks.map((t) => [t.task_id, t.name]));
+  renderPolicy(policy);
+  document.title = approvals.length ? `(${approvals.length}) Nexus Control Plane` : 'Nexus Control Plane';
   if (document.activeElement?.dataset?.draft) return; // don't clobber typing; the next event re-renders
   $('approvals').innerHTML = approvals.length ? approvals.map(approvalCard).join('') : '<div class="muted">Nothing waiting.</div>';
   $('tasks').innerHTML = tasks.map(taskCard).join('') || '<div class="muted">No tasks.</div>';
   for (const id of open) api(`/api/tasks/${id}/diff`).then((d) => renderDiff(id, d), () => {});
+  refreshOversight().catch(() => {});
 }
 
 function log(text) {
   $('log').insertAdjacentHTML('afterbegin', `<div>${new Date().toLocaleTimeString()} ${esc(text)}</div>`);
 }
 
+$('oversight').addEventListener('toggle', () => refreshOversight().catch(() => {}));
 document.addEventListener('input', (e) => { if (e.target.dataset.draft) drafts[e.target.dataset.draft] = e.target.value; });
 
 document.addEventListener('click', async (e) => {
@@ -155,7 +243,12 @@ function setStatus(s) {
 
 const es = new EventSource('/api/events');
 es.addEventListener('agent', (e) => { const d = JSON.parse(e.data); log(`${d.name} → ${d.state}${d.detail ? ' · ' + d.detail : ''}`); refresh(); });
-es.addEventListener('approval', (e) => { const a = JSON.parse(e.data); if (a.status !== 'pending') log(`approval ${a.status}${a.decision ? ' · ' + a.decision : ''}${a.decided_by ? ' by ' + a.decided_by : ''}`); refresh(); });
+es.addEventListener('approval', (e) => {
+  const a = JSON.parse(e.data);
+  log(`${a.kind.replace('_', ' ')} ${a.status}${a.decision ? ' · ' + a.decision : ''}${a.decided_by ? ' by ' + a.decided_by : ''}`);
+  refresh();
+});
+es.addEventListener('limit', (e) => { const d = JSON.parse(e.data); log(`limit ${d.action}: ${taskNames[d.task_id] || d.task_id} cpu ${Math.round(d.cpu)}% mem ${mb(d.memory)}`); refresh(); });
 es.addEventListener('task', () => refresh());
 es.addEventListener('nexus', (e) => { const d = JSON.parse(e.data); setStatus({ online: d.online, lastError: d.error }); if (!d.online) log('nexus: ' + d.error); });
 es.addEventListener('status', (e) => setStatus(JSON.parse(e.data)));

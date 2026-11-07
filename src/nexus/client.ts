@@ -1,7 +1,8 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
-import type { NexusApi, SessionState, WaitFor, WatchResult, WatchState } from './types.ts';
+import type { CallRecord } from '../calls.ts';
+import type { NexusApi, ReadResult, ResourceReading, SessionState, WaitFor, WatchResult, WatchState } from './types.ts';
 
 export class NexusError extends Error {
   constructor(message: string, readonly code?: string) {
@@ -32,7 +33,8 @@ export class NexusClient implements NexusApi {
   online = false;
   lastError?: string;
 
-  constructor(private url: string, private token: string) {}
+  /** `onCall` sees every tool call made to Nexus (for the call log): never the arguments' text, only the session. */
+  constructor(private url: string, private token: string, private onCall?: (c: CallRecord) => void) {}
 
   private async connect(): Promise<Client> {
     if (this.client) return this.client;
@@ -57,11 +59,18 @@ export class NexusClient implements NexusApi {
   }
 
   private async call(name: string, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
-    let res;
+    const started = Date.now();
+    const report = (ok: boolean, bytes: number, error?: string) =>
+      this.onCall?.({
+        direction: 'out', tool: name, ok, bytes, error, durationMs: Date.now() - started,
+        ...(typeof args.session === 'string' ? { session_id: args.session } : {}),
+      });
+    let res: any;
     try {
       const c = await this.connect();
       res = await c.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs });
     } catch (e: any) {
+      report(false, 0, e?.message);
       // A JSON-RPC error (bad params, unknown tool) is an answer, not an outage.
       if (e instanceof McpError) throw new NexusError(e.message, `mcp_${e.code}`);
       this.offline(e);
@@ -69,7 +78,15 @@ export class NexusClient implements NexusApi {
     }
     this.online = true;
     this.lastError = undefined;
-    return parseToolResult(res);
+    const bytes = (res?.content ?? []).reduce((n: number, c: any) => n + (c.text?.length ?? 0), 0);
+    try {
+      const out = parseToolResult(res);
+      report(true, bytes);
+      return out;
+    } catch (e: any) {
+      report(false, bytes, e.message);
+      throw e;
+    }
   }
 
   /**
@@ -135,6 +152,21 @@ export class NexusClient implements NexusApi {
 
   async stopSession(session: string) {
     await this.call('stop_session', { session });
+  }
+
+  /** The screen and scrollback as text; with since_cursor, only what was printed since. */
+  async readSession(session: string, o: { lines?: number; since_cursor?: number } = {}): Promise<ReadResult> {
+    const r = await this.call('read_session', { session, lines: o.lines ?? 80, ...(o.since_cursor !== undefined ? { since_cursor: o.since_cursor } : {}) });
+    return typeof r === 'string' ? { text: r } : { text: r?.text ?? '', ...(r?.cursor !== undefined ? { cursor: r.cursor } : {}), ...(r?.reset ? { reset: true } : {}) };
+  }
+
+  /** #56 resource_usage for one session. Undefined when this Nexus doesn't offer it or doesn't know the session. */
+  async resourceUsage(session: string): Promise<ResourceReading | undefined> {
+    if (!this.hasTool('resource_usage')) return undefined;
+    const r = await this.call('resource_usage', { session });
+    const s = Array.isArray(r?.sessions) ? r.sessions.find((x: any) => x.sessionId === session || x.id === session) : r;
+    if (!s || typeof s.cpu !== 'number') return undefined;
+    return { cpu: s.cpu, memory: s.memory ?? 0, processes: s.processes ?? 0, at: Date.now() };
   }
 
   async watchAgents(cursor: number | undefined, waitSec: number): Promise<WatchResult> {
