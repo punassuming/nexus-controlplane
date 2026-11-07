@@ -6,6 +6,7 @@
  *   send_keys     an orchestrator wants to type into its task's terminal; executes send_keys {text, enter}
  *   stop          an orchestrator wants to close its task; executes stop_session
  *   resume        a resource limit paused a task; executes pause_session {paused: false}
+ *   tool_call     an orchestrator called an upstream tool the policy marks 'approve'; executes that exact call
  */
 import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
@@ -13,8 +14,9 @@ import { audit } from './db.ts';
 import { NexusError } from './nexus/client.ts';
 import type { NexusApi, PromptOption } from './nexus/types.ts';
 import { PERSISTENT } from './policy.ts';
+import { redactCapped } from './redact.ts';
 
-export type ApprovalKind = 'agent_prompt' | 'send_keys' | 'stop' | 'resume';
+export type ApprovalKind = 'agent_prompt' | 'send_keys' | 'stop' | 'resume' | 'tool_call';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'stale';
 
 export interface Approval {
@@ -39,6 +41,7 @@ export interface Approval {
   decided_by: string | null;
   policy_rule: string | null;
   consumed_at: number | null;
+  result: string | null;
 }
 
 /** The action on screen (or the terminal) is not the one decided on. Nothing was sent. */
@@ -78,6 +81,8 @@ export interface ApprovalHooks {
   stopped?: (session: string) => void;
   /** A resume approval was executed. */
   resumed?: (session: string) => void;
+  /** Executes an approved tool_call on its upstream; returns the answer to keep for the orchestrator. */
+  callUpstream?: (upstream: string, tool: string, args: Record<string, unknown>) => Promise<string>;
 }
 
 export class ApprovalQueue {
@@ -128,7 +133,7 @@ export class ApprovalQueue {
   }
 
   /** An approval for an orchestrator's (or the resource limiter's) request. Always decided by a human. */
-  request(kind: 'send_keys' | 'stop' | 'resume', a: { session_id: string; task_id?: string | null; requested_by: string; request?: Record<string, any>; reason?: string }): Approval {
+  request(kind: 'send_keys' | 'stop' | 'resume' | 'tool_call', a: { session_id: string; task_id?: string | null; requested_by: string; request?: Record<string, any>; reason?: string }): Approval {
     return this.insert({ kind, ...a, request: a.request ?? {} });
   }
 
@@ -212,6 +217,21 @@ export class ApprovalQueue {
     }
 
     let decision: string;
+    if (a.kind === 'tool_call') {
+      try {
+        if (!this.hooks.callUpstream) throw new Error('no upstream executor');
+        const { upstream, tool, args } = a.request;
+        const result = await this.hooks.callUpstream(upstream, tool, args ?? {});
+        this.db.prepare('UPDATE approvals SET decision=?, consumed_at=?, result=? WHERE id=? AND consumed_at IS NULL')
+          .run('called', Date.now(), redactCapped(result, 64 * 1024), id);
+      } catch (e: any) {
+        reopen();
+        audit(this.db, 'approval.delivery_failed', id, { error: String(e?.message ?? e) });
+        throw e;
+      }
+      audit(this.db, 'approval.allow', id, { kind: a.kind, upstream: a.request.upstream, tool: a.request.tool, by });
+      return this.get(id)!;
+    }
     try {
       const live = await this.nexus.getState(a.session_id);
       const stale = (why: string, data: unknown) => {

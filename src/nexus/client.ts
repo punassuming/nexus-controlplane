@@ -26,19 +26,43 @@ export function normalizeSession(s: any): SessionState {
   return { ...s, agent: s.agent ?? null, running: s.running ?? !s.exited };
 }
 
+/** An upstream tool as the proxy re-exposes it. */
+export interface ToolDef {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  [k: string]: unknown;
+}
+
+/** The raw result of a tool call, passed back to orchestrators as is. */
+export interface RawResult {
+  content: Array<Record<string, unknown>>;
+  isError?: boolean;
+  structuredContent?: unknown;
+}
+
+/**
+ * An MCP client for one upstream server. For Nexus it also has typed helpers (NexusApi); for any upstream it lists
+ * full tool definitions and makes raw calls the proxy can pass through. Every call is reported to `onCall`.
+ */
 export class NexusClient implements NexusApi {
   private client?: Client;
   private tools?: Set<string>;
-  /** True while the last call to Nexus succeeded. When false the UI shows stale state. */
+  private defs: ToolDef[] = [];
+  /** True while the last call to the upstream succeeded. When false the UI shows stale state. */
   online = false;
   lastError?: string;
 
-  /** `onCall` sees every tool call made to Nexus (for the call log): never the arguments' text, only the session. */
-  constructor(private url: string, private token: string, private onCall?: (c: CallRecord) => void) {}
+  constructor(
+    private url: string,
+    private token: string,
+    private onCall?: (c: CallRecord) => void,
+    readonly upstream = 'nexus',
+  ) {}
 
   private async connect(): Promise<Client> {
     if (this.client) return this.client;
-    const client = new Client({ name: 'nexus-controlplane', version: '0.1.0' });
+    const client = new Client({ name: 'nexus-controlplane', version: '0.3.0' });
     const transport = new StreamableHTTPClientTransport(new URL(this.url), {
       requestInit: { headers: { Authorization: `Bearer ${this.token}` } },
     });
@@ -58,53 +82,61 @@ export class NexusClient implements NexusApi {
     this.disconnect();
   }
 
-  private async call(name: string, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
+  /** A tool call, returned exactly as the upstream answered (errors included). Throws only when unreachable. */
+  async callRaw(name: string, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<RawResult> {
     const started = Date.now();
-    const report = (ok: boolean, bytes: number, error?: string) =>
-      this.onCall?.({
-        direction: 'out', tool: name, ok, bytes, error, durationMs: Date.now() - started,
-        ...(typeof args.session === 'string' ? { session_id: args.session } : {}),
-      });
+    const session = typeof args.session === 'string' ? { session_id: args.session } : {};
     let res: any;
     try {
       const c = await this.connect();
       res = await c.callTool({ name, arguments: args }, undefined, { timeout: timeoutMs });
     } catch (e: any) {
-      report(false, 0, e?.message);
+      this.onCall?.({
+        direction: 'out', upstream: this.upstream, tool: name, ok: false, bytes: 0, error: e?.message,
+        durationMs: Date.now() - started, request: args, ...session,
+      });
       // A JSON-RPC error (bad params, unknown tool) is an answer, not an outage.
       if (e instanceof McpError) throw new NexusError(e.message, `mcp_${e.code}`);
       this.offline(e);
-      throw new NexusError(`nexus unreachable: ${e?.message ?? e}`, 'offline');
+      throw new NexusError(`${this.upstream} unreachable: ${e?.message ?? e}`, 'offline');
     }
     this.online = true;
     this.lastError = undefined;
-    const bytes = (res?.content ?? []).reduce((n: number, c: any) => n + (c.text?.length ?? 0), 0);
-    try {
-      const out = parseToolResult(res);
-      report(true, bytes);
-      return out;
-    } catch (e: any) {
-      report(false, bytes, e.message);
-      throw e;
-    }
+    const text = (res?.content ?? []).map((c: any) => c.text ?? '').join('');
+    this.onCall?.({
+      direction: 'out', upstream: this.upstream, tool: name, ok: !res?.isError, bytes: text.length,
+      durationMs: Date.now() - started, ...(res?.isError ? { error: text.slice(0, 300) } : {}),
+      request: args, response: text, ...session,
+    });
+    return res as RawResult;
+  }
+
+  private async call(name: string, args: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<any> {
+    return parseToolResult(await this.callRaw(name, args, timeoutMs));
   }
 
   /**
-   * Nexus never answers 401: a token it doesn't accept gets an "empty server" with no tools
-   * (mcp-gate.ts). So no tools means the token was rejected.
+   * Nexus never answers 401: a token it doesn't accept gets an empty server with no tools (mcp-gate.ts).
+   * So no tools means the token was rejected.
    */
   async listTools(): Promise<string[]> {
     try {
       const { tools } = await (await this.connect()).listTools();
-      if (!tools.length) throw new NexusError('Nexus returned an empty server: the supervisor token was not accepted', 'unauthorized');
+      if (!tools.length) throw new NexusError(`${this.upstream} returned an empty server: the token was not accepted`, 'unauthorized');
+      this.defs = tools as ToolDef[];
       this.tools = new Set(tools.map((t) => t.name));
       this.online = true;
       this.lastError = undefined;
       return [...this.tools];
     } catch (e: any) {
       this.offline(e);
-      throw e instanceof NexusError ? e : new NexusError(`nexus unreachable: ${e?.message ?? e}`, 'offline');
+      throw e instanceof NexusError ? e : new NexusError(`${this.upstream} unreachable: ${e?.message ?? e}`, 'offline');
     }
+  }
+
+  /** The upstream's tools as last listed, with their schemas. */
+  toolDefs(): ToolDef[] {
+    return this.defs;
   }
 
   hasTool(name: string): boolean {

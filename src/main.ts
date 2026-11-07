@@ -11,8 +11,10 @@ import { fileSecret } from './gateway.ts';
 import { Limits } from './limits.ts';
 import { NexusClient } from './nexus/client.ts';
 import { Policy } from './policy.ts';
+import { Push } from './push.ts';
 import { buildServer } from './server.ts';
 import { TaskStore } from './tasks.ts';
+import { Upstreams } from './upstreams.ts';
 
 const cfg = loadConfig();
 if (!cfg.nexusToken) throw new Error('NEXUS_SUPERVISOR_TOKEN is required');
@@ -26,26 +28,38 @@ if (!existsSync(cfg.gatewaySecretPath)) {
 }
 
 const db = openDb(cfg.dbPath);
-const calls = new CallLog(db);
+if (cfg.dbPath !== ':memory:') chmodSync(cfg.dbPath, 0o600); // transcripts live here
 const policy = new Policy(cfg.policyPath);
 if (!existsSync(cfg.policyPath)) console.warn(`no policy at ${cfg.policyPath}: defaults apply, and with no roots nothing can start`);
-const nexus = new NexusClient(cfg.nexusUrl, cfg.nexusToken, (c) => calls.record(c));
+const calls = new CallLog(db, policy);
+const record = (c: Parameters<CallLog['record']>[0]) => calls.record(c);
+const nexus = new NexusClient(cfg.nexusUrl, cfg.nexusToken, record);
+const upstreams = Upstreams.load(nexus, cfg.upstreamsPath, record);
 const bus = new Bus(db);
 const tasks = new TaskStore(db, nexus, policy);
 let limits: Limits;
 const approvals = new ApprovalQueue(db, nexus, () => policy.get().approvalTtlMs, {
   stopped: (session) => tasks.markStopped(session, 'approval'),
   resumed: (session) => limits.resumed(session),
+  callUpstream: async (upstream, tool, args) => {
+    const u = upstreams.get(upstream);
+    if (!u) throw new Error(`no upstream ${upstream}`);
+    const r = await u.client.callRaw(tool, args);
+    return r.content?.map((c: any) => c.text ?? '').join('') ?? '';
+  },
 });
 limits = new Limits(db, nexus, tasks, approvals, bus, policy);
 const poller = new Poller(db, nexus, tasks, approvals, bus, cfg.pollWaitSec);
+const push = new Push(db, cfg.vapidPath, cfg.pushSubject);
+push.attach(bus, tasks);
 let tools: string[] = [];
 
-// Learn which optional tools (get_state, pause_session, resource_usage) this Nexus has, then watch.
+// On start: sign on to Nexus with the supervisor token, learn every upstream's tools, then watch.
 const connect = async (): Promise<void> => {
   try {
     tools = await nexus.listTools();
     console.log('nexus tools:', tools.join(', '));
+    for (const [id, err] of Object.entries(await upstreams.refresh())) if (id !== 'nexus') console.warn(`upstream ${id}: ${err}`);
     poller.start();
     limits.start();
     const l = limits.status();
@@ -56,9 +70,13 @@ const connect = async (): Promise<void> => {
   }
 };
 void connect();
+// Upstream tool lists change (a Nexus upgrade adds tools); transcripts age out.
+setInterval(() => void upstreams.refresh().then(() => { tools = nexus.toolDefs().map((t) => t.name); }), 5 * 60_000);
+setInterval(() => calls.prune(), 60 * 60_000);
+calls.prune();
 
 const app = buildServer({
-  tasks, approvals, bus, policy, limits, calls, nexus, auth: cfg.auth,
+  db, upstreams, tasks, approvals, bus, policy, limits, calls, push, auth: cfg.auth,
   clients: new ClientRegistry(cfg.clientsPath),
   gatewaySecret: fileSecret(cfg.gatewaySecretPath),
   status: () => ({ online: nexus.online, lastError: nexus.lastError, tools }),

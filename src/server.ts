@@ -9,11 +9,12 @@ import { gitDiff } from './diff.ts';
 import type { Bus } from './events.ts';
 import type { Limits } from './limits.ts';
 import { NexusError } from './nexus/client.ts';
-import { createOrchestrator, gatewayClient, type OrchestratorDeps } from './orchestrator.ts';
+import { createProxy, gatewayClient, type ProxyDeps } from './proxy.ts';
+import type { Push } from './push.ts';
 import type { Policy } from './policy.ts';
 import { PolicyError, type TaskStore } from './tasks.ts';
 
-export interface Deps extends OrchestratorDeps {
+export interface Deps extends ProxyDeps {
   tasks: TaskStore;
   approvals: ApprovalQueue;
   bus: Bus;
@@ -21,6 +22,7 @@ export interface Deps extends OrchestratorDeps {
   limits: Limits;
   calls: CallLog;
   clients: ClientRegistry;
+  push?: Push;
   /** The internal secret the gateway presents on /orchestrator/mcp. */
   gatewaySecret: () => string;
   status: () => { online: boolean; lastError?: string; tools?: string[] };
@@ -31,7 +33,7 @@ declare module 'fastify' {
   interface FastifyRequest { user: string }
 }
 
-const indexHtml = () => readFile(fileURLToPath(new URL('../public/index.html', import.meta.url)), 'utf8');
+const publicFile = (name: string) => readFile(fileURLToPath(new URL(`../public/${name}`, import.meta.url)), 'utf8');
 
 /** Nexus refusals (permission_denied, agent_blocked, …) and policy refusals are the caller's problem; outages are a 502. */
 function fail(reply: FastifyReply, e: any) {
@@ -46,14 +48,14 @@ export function buildServer(d: Deps) {
   const { tasks, approvals, bus, status, auth } = d;
   const app = Fastify({ bodyLimit: 1024 * 1024 });
   app.decorateRequest('user', '');
-  const orchestrator = createOrchestrator(d);
+  const proxy = createProxy(d);
 
-  // Orchestrators, via the gateway only. Authenticated by the gateway's secret, not by the UI's auth.
+  // The MCP proxy for orchestrators, via the gateway only. Authenticated by the gateway's secret, not by the UI's auth.
   app.post('/orchestrator/mcp', async (req, reply) => {
     const who = gatewayClient(req.headers, d.gatewaySecret(), d.policy);
     if ('error' in who) return reply.code(who.status).send({ error: who.error });
     reply.hijack();
-    await orchestrator(req.raw, reply.raw, req.body, who.client);
+    await proxy(req.raw, reply.raw, req.body, who.client);
   });
   app.route({ method: ['GET', 'DELETE'], url: '/orchestrator/mcp', handler: (_req, reply) => reply.code(405).header('allow', 'POST').send() });
 
@@ -78,13 +80,34 @@ export function buildServer(d: Deps) {
     }
   });
 
-  app.get('/', async (_req, reply) => reply.type('text/html').send(await indexHtml()));
+  app.get('/', async (_req, reply) => reply.type('text/html').send(await publicFile('index.html')));
+  // The installable app: the service worker shows pushes; the manifest makes it a home-screen app (needed on iOS).
+  app.get('/sw.js', async (_req, reply) => reply.type('text/javascript').header('cache-control', 'no-cache').send(await publicFile('sw.js')));
+  app.get('/manifest.webmanifest', async (_req, reply) => reply.type('application/manifest+json').send(await publicFile('manifest.webmanifest')));
+  app.get('/icon.svg', async (_req, reply) => reply.type('image/svg+xml').send(await publicFile('icon.svg')));
+
+  app.get('/api/push', async (req) => ({ enabled: !!d.push, publicKey: d.push?.publicKey() ?? null, devices: d.push?.count(req.user) ?? 0 }));
+  app.post('/api/push/subscribe', async (req, reply) => {
+    if (!d.push) return reply.code(404).send({ error: 'push is off' });
+    try { d.push.subscribe(req.user, (req.body as any)?.subscription); return { ok: true, devices: d.push.count(req.user) }; }
+    catch (e: any) { return reply.code(400).send({ error: e.message }); }
+  });
+  app.post('/api/push/unsubscribe', async (req) => { d.push?.unsubscribe(String((req.body as any)?.endpoint ?? ''), req.user); return { ok: true }; });
+  app.post('/api/push/test', async (req, reply) => {
+    if (!d.push) return reply.code(404).send({ error: 'push is off' });
+    return d.push.notify({ title: 'Nexus Control Plane', body: `Test notification for ${req.user}`, url: '/', tag: 'test' });
+  });
   app.get('/api/status', async (req) => ({ ...status(), user: req.user }));
   app.get('/api/tasks', async () => tasks.list());
   app.get('/api/approvals', async (req) => approvals.list((req.query as any).status));
   app.get('/api/policy', async () => ({ policy: d.policy.get(), error: d.policy.error ?? null, limits: d.limits.status() }));
   app.get('/api/clients', async () => d.clients.list());
-  app.get('/api/calls', async (req) => d.calls.recent(Number((req.query as any).limit ?? 100)));
+  app.get('/api/calls', async (req) => {
+    const q = req.query as any;
+    return d.calls.recent({ limit: Number(q.limit ?? 100), client: q.client || undefined, task_id: q.task || undefined });
+  });
+  // One transaction with its (masked) request and response.
+  app.get('/api/calls/:id', async (req, reply) => d.calls.get(Number((req.params as any).id)) ?? reply.code(404).send({ error: 'unknown call' }));
   app.get('/api/metrics', async (req) => d.calls.metrics(Number((req.query as any).since ?? 0)));
 
   app.post('/api/tasks', async (req, reply) => {

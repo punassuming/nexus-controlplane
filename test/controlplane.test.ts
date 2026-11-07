@@ -190,15 +190,28 @@ test('guide while the agent is blocked surfaces agent_blocked', async (t) => {
   await assert.rejects(h.tasks.prompt(task.task_id, 'hi', 'ui'), (e: any) => e.code === 'agent_blocked');
 });
 
-test('every Nexus call is in the call log, without prompt text', async (t) => {
+test('every Nexus call is recorded: full masked transcripts, or metadata only when the policy says so', async (t) => {
   const h = await harness(t);
-  const { task } = await atPrompt(h);
+  const task = await h.tasks.create({ agent: 'claude', cwd: h.root, prompt: 'deploy with API_KEY=sk-ant-abcdefghijklmnopqrstuv', name: 'tx' });
   await h.poller.tick();
-  const out = h.calls.recent(1000).filter((c: any) => c.direction === 'out') as any[];
-  for (const tool of ['start_agent', 'watch_agents', 'get_state']) assert.ok(out.some((c) => c.tool === tool), tool);
-  assert.ok(out.some((c) => c.tool === 'start_agent' && c.ok === 1));
-  assert.ok(out.some((c) => c.session_id === task.session_id));
-  assert.doesNotMatch(JSON.stringify(h.calls.recent(1000)), /run the tests/);
+  const out = h.calls.recent({ limit: 1000, payloads: true }).filter((c: any) => c.direction === 'out') as any[];
+  for (const tool of ['start_agent', 'watch_agents']) assert.ok(out.some((c) => c.tool === tool), tool);
+  const start = out.find((c) => c.tool === 'start_agent');
+  assert.equal(start.upstream, 'nexus');
+  assert.equal(start.ok, 1);
+  assert.match(start.request, /deploy with API_KEY=«redacted»/, 'payload kept, secret masked');
+  assert.doesNotMatch(JSON.stringify(h.calls.recent({ limit: 1000, payloads: true })), /sk-ant-abcdef/);
+  assert.match(start.response, new RegExp(task.session_id!));
+  assert.equal(h.calls.recent(5).every((c: any) => !('request' in c)), true, 'listings leave payloads out');
+
+  h.policy.get().transcripts.level = 'metadata';
+  await h.poller.tick();
+  const last = h.calls.recent({ limit: 1, payloads: true })[0] as any;
+  assert.deepEqual([last.tool, last.request, last.response], ['watch_agents', null, null]);
+
+  h.policy.get().transcripts.retentionDays = 0;
+  assert.ok(h.calls.prune(Date.now() + 1) > 0);
+  assert.equal(h.calls.recent().length, 0);
 });
 
 test('diff: unborn repo, tracked changes and untracked files', async () => {

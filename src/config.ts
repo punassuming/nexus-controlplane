@@ -12,6 +12,12 @@ export interface Config {
   clientsPath: string;
   /** The internal secret only the gateway presents (0600, created on first start). */
   gatewaySecretPath: string;
+  /** Other MCP servers to proxy (JSON, outside Git). Nexus is always proxied. */
+  upstreamsPath: string;
+  /** Web Push keys (0600, created on first start). */
+  vapidPath: string;
+  /** VAPID subject: a mailto: or https: contact for push services. */
+  pushSubject: string;
   pollWaitSec: number;
   auth: { mode: AuthMode; token: string; allowedUsers: string[] };
 }
@@ -32,6 +38,9 @@ export function loadConfig(env = process.env): Config {
     policyPath: env.CONTROLPLANE_POLICY ?? 'data/policy.json',
     clientsPath: env.CONTROLPLANE_CLIENTS ?? 'data/clients.json',
     gatewaySecretPath: env.CONTROLPLANE_GATEWAY_SECRET ?? 'data/gateway.secret',
+    upstreamsPath: env.CONTROLPLANE_UPSTREAMS ?? 'data/upstreams.json',
+    vapidPath: env.CONTROLPLANE_VAPID ?? 'data/vapid.json',
+    pushSubject: env.CONTROLPLANE_PUSH_SUBJECT ?? 'mailto:nexus-controlplane@localhost',
     // Nexus's watch_agents default; most MCP clients allow a call about a minute.
     pollWaitSec: Math.min(Number(env.POLL_WAIT_SEC ?? 50), 50),
     auth: {

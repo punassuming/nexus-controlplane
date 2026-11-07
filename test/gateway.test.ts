@@ -39,9 +39,9 @@ test('gateway: a client key gets the orchestrator tools over TLS; the Nexus toke
 
   const muse = await mcpClient(t, url, { authorization: `Bearer ${key}` });
   assert.equal((await muse.call('whoami')).client, 'muse');
-  const task = await muse.call('start_task', { agent: 'claude', cwd: h.root });
+  const task = await muse.call('start_agent', { agent: 'claude', cwd: h.root });
   assert.equal(h.tasks.get(task.task)!.client_id, 'muse');
-  assert.ok(lines.some((l) => l.client === 'muse' && l.tool === 'start_task' && l.status === 200), 'one log line per request, with the tool');
+  assert.ok(lines.some((l) => l.client === 'muse' && l.tool === 'start_agent' && l.status === 200), 'one log line per request, with the tool');
   assert.ok(!JSON.stringify(lines).includes(h.nexus.token));
 });
 
@@ -69,7 +69,7 @@ test('gateway: a client cannot claim another identity or reach other paths', asy
   const spoof = await post(url, { authorization: `Bearer ${key}`, 'x-cp-client': 'admin', 'x-cp-gateway': 'guess' },
     JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'whoami', arguments: {} } }));
   const body = await spoof.text();
-  assert.match(body, /\\"client\\":\\"muse\\"/, 'x-cp-* from the client are replaced');
+  assert.match(body, /\\"client\\": ?\\"muse\\"/, 'x-cp-* from the client are replaced');
   assert.equal((await post(url.replace('/mcp', '/api/tasks'), { authorization: `Bearer ${key}` })).status, 404, 'only /mcp is forwarded');
   assert.equal((await fetch(url, { headers: { authorization: `Bearer ${key}` } })).status, 405);
   assert.equal(h.tasks.list().length, 0);

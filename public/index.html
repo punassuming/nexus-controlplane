@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nexus Control Plane</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1117">
 <style>
   :root { --bg:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#d8dee4; --card:#f6f8fa; --warn:#9a6700; --bad:#cf222e; --ok:#1a7f37; --accent:#0969da; }
   @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --card:#161b22; --warn:#d29922; --bad:#f85149; --ok:#3fb950; --accent:#4493f8; } }
@@ -33,12 +38,14 @@
   table { border-collapse:collapse; width:100%; font-size:12px } td, th { text-align:left; padding:3px 6px; border-bottom:1px solid var(--line); vertical-align:top }
   details > summary { cursor:pointer; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; margin:22px 0 8px }
   .scroll { overflow-x:auto }
+  .card.target { outline:2px solid var(--accent) }
+  tr.call { cursor:pointer } tr.call:hover td { background:var(--bg) }
   @media (max-width:640px) { form.start { grid-template-columns:1fr } body { padding:12px } }
 </style>
 </head>
 <body>
-<header><h1>Nexus Control Plane</h1><span class="muted small" id="who"></span></header>
-<div class="muted small">Terminals stay in Nexus. Orchestrators work through the gateway; anything that types into or closes a terminal waits here for you.</div>
+<header><h1>Nexus Control Plane</h1><span class="muted small grow" id="who"></span><span class="row"><button id="notify" hidden>Enable notifications</button><button id="notify-test" hidden>Test</button><span class="muted small" id="notify-msg"></span></span></header>
+<div class="muted small">Terminals stay in Nexus. Orchestrators reach it through this proxy; anything that types into or closes a terminal waits here for you.</div>
 <div id="banner" class="warnbox"></div>
 <div id="warnings"></div>
 
@@ -60,7 +67,9 @@
 <details id="oversight"><summary>Policy, orchestrators and calls</summary>
   <div class="card" id="policy"></div>
   <div class="card scroll" id="metrics"></div>
-  <div class="card scroll" id="calls"></div>
+  <div class="card scroll" id="calls"><div class="row"><b class="grow">MCP transactions</b><select id="calls-client" aria-label="Orchestrator"><option value="">everyone</option></select></div>
+    <table><thead><tr><th>time</th><th>route</th><th>tool</th><th>task</th><th>ok</th><th>ms</th></tr></thead><tbody id="calls-body"></tbody></table>
+    <div class="small muted">Tap a row for its request and response (secrets masked).</div></div>
 </details>
 
 <script>
@@ -85,13 +94,17 @@ function approvalBody(a) {
       <div class="muted small">${a.request.enter ? 'then press Enter' : 'without pressing Enter'}</div>`;
   }
   if (a.kind === 'stop') return `<b>${esc(who(a))} wants to stop ${task}</b><div class="muted small">closes the terminal and everything running in it</div>`;
+  if (a.kind === 'tool_call') {
+    return `<b>${esc(who(a))} wants to call ${esc(a.request.upstream)} · ${esc(a.request.tool)}</b>
+      <pre class="wrap">${esc(JSON.stringify(a.request.args, null, 2))}</pre>`;
+  }
   if (a.kind === 'resume') return `<b>${task} was paused by the resource limiter</b><div class="muted small">resume its processes?</div>`;
   return `<b>${esc(a.detail || 'Input needed')}</b><div class="muted small">${task} is asking</div>${a.tail ? `<pre>${esc(a.tail)}</pre>` : ''}`;
 }
 
 function approvalButtons(a) {
   if (a.kind !== 'agent_prompt') {
-    const yes = { send_keys: 'Type it', stop: 'Stop task', resume: 'Resume' }[a.kind];
+    const yes = { send_keys: 'Type it', stop: 'Stop task', resume: 'Resume', tool_call: 'Run it' }[a.kind];
     return `<button class="allow" data-approval="${a.id}" data-kind="allow"><b>${yes}</b></button>
       <button class="deny" data-approval="${a.id}" data-kind="deny"><b>Deny</b></button>`;
   }
@@ -105,7 +118,7 @@ function approvalButtons(a) {
 }
 
 function approvalCard(a) {
-  return `<div class="card">
+  return `<div class="card${location.hash === '#approval-' + a.id ? ' target' : ''}" id="approval-${a.id}">
     <div class="row"><span class="dot needs-input"></span><span class="tag">${esc(a.kind.replace('_', ' '))}</span>
       <span class="grow"></span><span class="muted small">waiting ${ago(a.created_at)} · expires ${new Date(a.expires_at).toLocaleTimeString()}</span></div>
     <div style="margin-top:6px">${approvalBody(a)}</div>
@@ -151,26 +164,82 @@ function renderPolicy({ policy: p, error, limits }) {
 
 function renderMetrics(m, clients) {
   const byId = Object.fromEntries(m.clients.map((c) => [c.client, c]));
-  const ids = [...new Set([...clients.map((c) => c.id), ...m.clients.map((c) => c.client)])];
-  $('metrics').innerHTML = `<b>Orchestrators</b><table><tr><th>client</th><th>key</th><th>calls</th><th>wakes</th><th>≈tokens read</th><th>errors</th></tr>
+  const ids = [...new Set([...clients.map((c) => c.id), ...m.clients.map((c) => c.client).filter(Boolean)])];
+  $('metrics').innerHTML = `<b>Orchestrators</b><table><tr><th>client</th><th>key</th><th>calls</th><th>wakes</th><th>≈tokens read</th><th>approvals</th><th>denied</th><th>errors</th></tr>
     ${ids.map((id) => { const c = byId[id] || {}; const k = clients.find((x) => x.id === id);
-      return `<tr><td>${esc(id)}</td><td>${k ? (k.enabled ? 'active' : 'disabled') : 'revoked'}</td><td>${c.calls ?? 0}</td><td>${c.wakes ?? 0}</td><td>${c.approxTokens ?? 0}</td><td>${c.errors ?? 0}</td></tr>`; }).join('')
-      || '<tr><td colspan="6" class="muted">No orchestrator keys yet (npm run client -- add &lt;id&gt;).</td></tr>'}
-    </table><div class="small muted">Nexus calls: ${m.nexus.calls} (${m.nexus.errors} failed)</div>`;
+      return `<tr><td>${esc(id)}</td><td>${k ? (k.enabled ? 'active' : 'disabled') : 'revoked'}</td><td>${c.calls ?? 0}</td><td>${c.wakes ?? 0}</td>
+        <td>${c.approxTokens ?? 0}</td><td>${c.approvals ?? 0}</td><td>${c.denied ?? 0}</td><td>${c.errors ?? 0}</td></tr>`; }).join('')
+      || '<tr><td colspan="8" class="muted">No orchestrator keys yet (npm run client -- add &lt;id&gt;).</td></tr>'}
+    </table><div class="small muted">Upstream calls: ${m.upstreams.map((u) => `${esc(u.upstream)} ${u.calls} (${u.errors ?? 0} failed)`).join(' · ') || 'none'}</div>`;
+  const sel = $('calls-client');
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">everyone</option>${ids.map((id) => `<option${id === cur ? ' selected' : ''}>${esc(id)}</option>`).join('')}`;
 }
 
+const DECISION = { forwarded: '', local: 'answered here', approval: 'approval', denied: 'denied', error: 'error' };
+
 function renderCalls(rows) {
-  $('calls').innerHTML = `<b>Recent MCP calls</b><table><tr><th>time</th><th>dir</th><th>client</th><th>tool</th><th>task / session</th><th>ok</th><th>ms</th></tr>
-    ${rows.slice(0, 60).map((c) => `<tr><td>${new Date(c.ts).toLocaleTimeString()}</td><td>${c.direction === 'in' ? '→ cp' : 'cp → nexus'}</td><td>${esc(c.client || '')}</td>
-      <td>${esc(c.tool)}${c.wake ? ' <span class="tag">wake</span>' : ''}</td><td>${esc(taskNames[c.task_id] || c.task_id || c.session_id || '')}</td>
-      <td>${c.ok ? '✓' : `<span title="${esc(c.error)}">✗</span>`}</td><td>${c.duration_ms}</td></tr>`).join('')}</table>`;
+  $('calls-body').innerHTML = rows.map((c) => `<tr class="call" data-call="${c.id}"><td>${new Date(c.ts).toLocaleTimeString()}</td>
+      <td>${c.direction === 'in' ? `${esc(c.client || '')} → proxy` : `proxy → ${esc(c.upstream || 'nexus')}`}</td>
+      <td>${esc(c.tool)}${c.wake ? ' <span class="tag">wake</span>' : ''}${c.decision && DECISION[c.decision] ? ` <span class="tag${c.decision === 'denied' ? ' warn' : ''}">${DECISION[c.decision]}</span>` : ''}</td>
+      <td>${esc(taskNames[c.task_id] || c.session_id || '')}</td>
+      <td>${c.ok ? '✓' : `<span title="${esc(c.error)}">✗</span>`}</td><td>${c.duration_ms}</td></tr>
+      <tr hidden id="call-${c.id}"><td colspan="6"></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No calls yet.</td></tr>';
+}
+
+/** One transaction's masked request and response. */
+async function toggleCall(id) {
+  const row = $('call-' + id);
+  if (!row.hidden) { row.hidden = true; return; }
+  const c = await api(`/api/calls/${id}`);
+  const pretty = (s) => { if (s == null) return '(not kept: transcripts are metadata-only)'; try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } };
+  row.firstElementChild.innerHTML = `<div class="small muted">request</div><pre class="wrap">${esc(pretty(c.request))}</pre>
+    <div class="small muted" style="margin-top:6px">response${c.approval_id ? ` · approval ${esc(c.approval_id)}` : ''}</div><pre class="wrap">${esc(pretty(c.response))}</pre>`;
+  row.hidden = false;
 }
 
 async function refreshOversight() {
   if (!$('oversight').open) return;
-  const [m, clients, calls] = await Promise.all([api('/api/metrics'), api('/api/clients'), api('/api/calls?limit=60')]);
+  const client = $('calls-client').value;
+  const [m, clients, calls] = await Promise.all([api('/api/metrics'), api('/api/clients'), api(`/api/calls?limit=60${client ? `&client=${encodeURIComponent(client)}` : ''}`)]);
   renderMetrics(m, clients);
-  renderCalls(calls);
+  // Don't collapse a transcript someone is reading.
+  if (!document.querySelector('tr[id^="call-"]:not([hidden])')) renderCalls(calls);
+}
+
+// ---- Web Push: this page as an installed app on the phone ----
+const b64 = (s) => { const p = '='.repeat((4 - (s.length % 4)) % 4); const r = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from([...r].map((c) => c.charCodeAt(0))); };
+
+async function setupPush() {
+  const info = await api('/api/push').catch(() => ({ enabled: false }));
+  if (!info.enabled || !('serviceWorker' in navigator) || !('PushManager' in window)) {
+    if (info.enabled && !window.isSecureContext) $('notify-msg').textContent = 'notifications need HTTPS (tailscale serve)';
+    else if (info.enabled && /iPhone|iPad/.test(navigator.userAgent)) $('notify-msg').textContent = 'add to Home Screen for notifications';
+    return;
+  }
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  const show = (on) => { $('notify').hidden = false; $('notify').textContent = on ? 'Notifications on' : 'Enable notifications'; $('notify-test').hidden = !on; };
+  show(!!(await reg.pushManager.getSubscription()) && Notification.permission === 'granted');
+  $('notify').onclick = async () => {
+    try {
+      const existing = await reg.pushManager.getSubscription();
+      if (existing && Notification.permission === 'granted') {
+        if (!confirm('Turn off notifications on this device?')) return;
+        await api('/api/push/unsubscribe', 'POST', { endpoint: existing.endpoint });
+        await existing.unsubscribe();
+        return show(false);
+      }
+      if ((await Notification.requestPermission()) !== 'granted') { $('notify-msg').textContent = 'permission denied'; return; }
+      const sub = existing || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64(info.publicKey) });
+      await api('/api/push/subscribe', 'POST', { subscription: sub.toJSON() });
+      show(true);
+      $('notify-msg').textContent = '';
+    } catch (err) { $('notify-msg').textContent = err.message; }
+  };
+  $('notify-test').onclick = async () => {
+    const r = await api('/api/push/test', 'POST', {}).catch((e) => ({ error: e.message }));
+    $('notify-msg').textContent = r.error ? r.error : `sent to ${r.sent} device(s)${r.failed ? `, ${r.failed} failed` : ''}`;
+  };
 }
 
 async function refresh() {
@@ -180,6 +249,7 @@ async function refresh() {
   document.title = approvals.length ? `(${approvals.length}) Nexus Control Plane` : 'Nexus Control Plane';
   if (document.activeElement?.dataset?.draft) return; // don't clobber typing; the next event re-renders
   $('approvals').innerHTML = approvals.length ? approvals.map(approvalCard).join('') : '<div class="muted">Nothing waiting.</div>';
+  if (location.hash.startsWith('#approval-')) document.getElementById(location.hash.slice(1))?.scrollIntoView({ block: 'center' });
   $('tasks').innerHTML = tasks.map(taskCard).join('') || '<div class="muted">No tasks.</div>';
   for (const id of open) api(`/api/tasks/${id}/diff`).then((d) => renderDiff(id, d), () => {});
   refreshOversight().catch(() => {});
@@ -190,6 +260,8 @@ function log(text) {
 }
 
 $('oversight').addEventListener('toggle', () => refreshOversight().catch(() => {}));
+$('calls-client').addEventListener('change', () => refreshOversight().catch(() => {}));
+$('calls-body').addEventListener('click', (e) => { const r = e.target.closest('tr.call'); if (r) toggleCall(r.dataset.call).catch((err) => alert(err.message)); });
 document.addEventListener('input', (e) => { if (e.target.dataset.draft) drafts[e.target.dataset.draft] = e.target.value; });
 
 document.addEventListener('click', async (e) => {
@@ -253,6 +325,8 @@ es.addEventListener('task', () => refresh());
 es.addEventListener('nexus', (e) => { const d = JSON.parse(e.data); setStatus({ online: d.online, lastError: d.error }); if (!d.online) log('nexus: ' + d.error); });
 es.addEventListener('status', (e) => setStatus(JSON.parse(e.data)));
 api('/api/status').then((s) => { $('who').textContent = `signed in as ${s.user}`; setStatus(s); });
+setupPush().catch((e) => { $('notify-msg').textContent = e.message; });
+window.addEventListener('hashchange', () => refresh());
 refresh();
 </script>
 </body>

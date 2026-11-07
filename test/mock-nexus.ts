@@ -49,6 +49,10 @@ export class MockNexus {
   usage = new Map<string, { cpu: number; memory: number; processes: number }>();
   /** What each terminal has printed, for read_session. */
   screens = new Map<string, string>();
+  /** What `where` reports as overlapping agents (shape not fixed by the protocol excerpt; any JSON naming sessions). */
+  overlaps: unknown[] = [];
+  /** A tool a newer Nexus might add, unknown to the proxy. */
+  extraTool = false;
   private seq = 0;
   private waiters: (() => void)[] = [];
   server!: Server;
@@ -106,6 +110,14 @@ export class MockNexus {
       return { text, cursor: all.length };
     });
     reg('list_sessions', {}, () => [...this.sessions.values()].map((s) => this.summary(s)));
+    reg('where', {}, () => ({
+      sessions: [...this.sessions.values()].map((s) => ({ sessionId: s.id, name: s.name, agent: { id: s.agent.id, displayName: s.agent.id, state: s.agent.state }, cwd: s.cwd })),
+      overlaps: this.overlaps,
+    }));
+    reg('wait_for', {
+      session, state: z.enum(WAIT_STATES).default('settled'),
+      timeout_seconds: z.number().int().min(1).default(600), next: z.boolean().default(true),
+    }, (a) => this.summary(this.find(a.session)));
     reg('start_agent', {
       agent: z.enum(AGENTS), prompt: z.string().optional(), name: z.string().optional(),
       placement: z.enum(['split', 'tab', 'background']).default('split'), cwd: z.string().optional(), args: z.array(z.string()).optional(),
@@ -154,6 +166,9 @@ export class MockNexus {
       const events = pending();
       return { events, cursor: Math.max(this.seq, after), ...(missed ? { missed: true } : {}) };
     });
+    if (this.extraTool) {
+      reg('rename_session', { session, name: z.string() }, (a) => { this.find(a.session).name = a.name; return `renamed ${a.session}`; });
+    }
     if (this.withIssue56Tools) {
       reg('get_state', { session }, (a) => {
         const s = this.find(a.session);

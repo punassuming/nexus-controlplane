@@ -45,6 +45,11 @@ export class Limits {
     return this.latest.get(task_id);
   }
 
+  /** Did the limiter pause this session (so resuming it is a person's call)? */
+  pausedByLimiter(session: string): boolean {
+    return this.paused.has(session);
+  }
+
   resumed(session: string) {
     this.paused.delete(session);
     this.breachSince.delete(session);

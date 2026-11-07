@@ -21,9 +21,9 @@ export function openDb(path: string): DatabaseSync {
     );
     CREATE TABLE IF NOT EXISTS approvals (
       id            TEXT PRIMARY KEY,
-      kind          TEXT NOT NULL,    -- agent_prompt | send_keys | stop | resume
+      kind          TEXT NOT NULL,    -- agent_prompt | send_keys | stop | resume | tool_call
       task_id       TEXT,
-      session_id    TEXT NOT NULL,
+      session_id    TEXT NOT NULL,    -- '' for tool_call on a non-Nexus upstream
       requested_by  TEXT NOT NULL,    -- 'agent', 'limits' or an orchestrator client id
       request       TEXT NOT NULL,    -- the exact action, JSON
       request_hash  TEXT NOT NULL,
@@ -40,7 +40,8 @@ export function openDb(path: string): DatabaseSync {
       decision      TEXT,
       decided_by    TEXT,
       policy_rule   TEXT,
-      consumed_at   INTEGER
+      consumed_at   INTEGER,
+      result        TEXT              -- tool_call: the upstream's answer (masked)
     );
     CREATE TABLE IF NOT EXISTS audit (
       id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +63,7 @@ export function openDb(path: string): DatabaseSync {
       ts          INTEGER NOT NULL,
       direction   TEXT NOT NULL,      -- in: an orchestrator called us; out: we called Nexus
       client      TEXT,
+      upstream    TEXT,               -- out: which MCP server (NULL = nexus)
       tool        TEXT NOT NULL,
       task_id     TEXT,
       session_id  TEXT,
@@ -69,7 +71,18 @@ export function openDb(path: string): DatabaseSync {
       error       TEXT,
       duration_ms INTEGER NOT NULL,
       bytes       INTEGER NOT NULL,   -- response size; ~4 bytes per token for the orchestrator's budget
-      wake        INTEGER NOT NULL DEFAULT 0
+      wake        INTEGER NOT NULL DEFAULT 0,
+      decision    TEXT,               -- in: forwarded | local | approval | denied | error
+      approval_id TEXT,
+      request     TEXT,               -- masked, size-capped payloads (transcripts.level = full)
+      response    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS mcp_calls_ts ON mcp_calls (ts);
+    CREATE TABLE IF NOT EXISTS push_subs (
+      endpoint   TEXT PRIMARY KEY,
+      user       TEXT NOT NULL,
+      keys       TEXT NOT NULL,       -- p256dh + auth, JSON
+      created_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   `);

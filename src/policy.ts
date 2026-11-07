@@ -36,7 +36,24 @@ export const PolicySchema = z.object({
   lowRisk: z.array(z.object({ id: z.string(), agent: z.string().optional(), detail: z.string() })).default([]),
   /** Per-orchestrator scope. Can narrow the global lists, never widen them. Unlisted clients get the global scope. */
   clients: z.record(z.string(), ClientScope).default({}),
+  /** What the proxy keeps of each MCP transaction, both directions. Secrets are masked before storage. */
+  transcripts: z.object({
+    level: z.enum(['full', 'metadata']).default('full'),
+    retentionDays: z.number().min(0).default(14),
+    maxPayloadBytes: z.number().int().min(256).default(64 * 1024),
+  }).default({ level: 'full', retentionDays: 14, maxPayloadBytes: 64 * 1024 }),
+  /**
+   * Tools of upstream MCP servers other than Nexus, per upstream: allow (forward), approve (phone first) or deny
+   * (hidden). Tools not listed get `default`. Nexus's own tools have fixed rules (see proxy/nexus.ts); a Nexus tool
+   * the proxy doesn't know yet is hidden unless listed under `nexus`.
+   */
+  upstreams: z.record(z.string(), z.object({
+    default: z.enum(['allow', 'approve', 'deny']).default('deny'),
+    tools: z.record(z.string(), z.enum(['allow', 'approve', 'deny'])).default({}),
+  })).default({}),
 });
+
+export type ToolRule = 'allow' | 'approve' | 'deny';
 
 export type PolicyConfig = z.infer<typeof PolicySchema>;
 export type PolicyInput = z.input<typeof PolicySchema>;
@@ -105,6 +122,12 @@ export class Policy {
     const max = this.get().maxActiveTasks;
     if (i.active >= max) return { verdict: 'deny', reason: `${i.active} active task(s); the limit is ${max}` };
     return { verdict: 'allow' };
+  }
+
+  /** The rule for a tool of an upstream that isn't handled by a dedicated adapter. */
+  toolRule(upstream: string, tool: string): ToolRule {
+    const u = this.get().upstreams[upstream];
+    return u?.tools[tool] ?? u?.default ?? 'deny';
   }
 
   /**
